@@ -30,14 +30,16 @@ else:
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps)
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64]
         for num_warps in [1, 2, 4]
-    ],
-    key=["H", "Hg", "K", "BC"],
+        for num_stages in [2, 3]
+    ]
+    + [triton.Config({"BK": 128}, num_warps=1, num_stages=3)],
+    key=["H", "Hg", "K", "BC", "NT"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "NT"])
 def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     k,
     g,
@@ -46,6 +48,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     cu_seqlens,
     chunk_indices,
     T,
+    NT,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -437,6 +440,7 @@ def chunk_gated_delta_rule_fwd_intra(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
+        NT=NT,
         H=H,
         Hg=Hg,
         K=K,
