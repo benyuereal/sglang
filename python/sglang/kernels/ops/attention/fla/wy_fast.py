@@ -114,8 +114,8 @@ def recompute_w_u_fwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 64
-    BV = 64
+    BK = 128 if K >= 128 else 64
+    BV = 128 if V >= 128 else 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     head_major = use_gfx115_kernels()
@@ -140,7 +140,7 @@ def recompute_w_u_fwd(
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
-        num_stages=3,
+        num_stages=2 if BK == 128 else 3,
     )
     return w, u
 
