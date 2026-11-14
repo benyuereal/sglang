@@ -790,6 +790,14 @@ class BaseMultimodalProcessor(ABC):
             platform = platforms.current_platform
             if not platform.is_cuda_alike():
                 return None
+            # The tokenizer process has no reason to hold a device context, and
+            # on HCU a second one on the serving card oversubscribes its runlist.
+            if (
+                not self.keep_mm_features_on_device
+                and not envs.SGLANG_FORCE_MM_FAST_PROCESSOR_GPU.get()
+                and not torch.cuda.is_initialized()
+            ):
+                return None
             # Per-worker placement travels as a constructor argument, and
             # this record is that argument.
             return f"{platform.device_type}:{server_args.base_gpu_id}"

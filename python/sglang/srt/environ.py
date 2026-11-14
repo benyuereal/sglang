@@ -1460,6 +1460,9 @@ class Envs:
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # Currently supported by the Kimi-K2.5 image processor only.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
+    # Run the fast image processor on the device even in a process that has not
+    # initialized CUDA; that context costs an HCU card its whole runlist budget.
+    SGLANG_FORCE_MM_FAST_PROCESSOR_GPU = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
