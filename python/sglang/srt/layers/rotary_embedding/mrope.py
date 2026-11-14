@@ -265,6 +265,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         self._match_cos_sin_cache_dtype(query)
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)
+        if positions.ndim == 1:
+            return super().forward_cuda(
+                positions, query, key, fused_set_kv_buffer_arg=fused_set_kv_buffer_arg
+            )
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     def forward_triton(

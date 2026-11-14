@@ -308,8 +308,10 @@ def fused_mamba_state_scatter_with_mask(
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
 
-    # Block size for copying elements
-    BLOCK_SIZE = 1024
+    # Large states are dispatch-bound at 1024 elements/CTA: 48 layers x 40
+    # reqs x 768 blocks is 1.47M CTAs for a 6 GiB copy. 16K elements/CTA is
+    # ~3.4x faster on gfx938 (measured); small states keep the old block.
+    BLOCK_SIZE = 16384 if elem_per_entry >= 65536 else 1024
 
     # Grid over all requests - invalid ones will early-exit in the kernel
     grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
@@ -506,6 +508,8 @@ def _fused_conv_window_scatter_multi_kernel(
     dst_req_size,
     NUM_TYPES: tl.constexpr,
     META_COLS: tl.constexpr,
+    CONTIG: tl.constexpr,
+    ELEM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_req = tl.program_id(0)
@@ -560,19 +564,54 @@ def _fused_conv_window_scatter_multi_kernel(
 
             start = (pid_block - block_start) * BLOCK_SIZE
             e = start + tl.arange(0, BLOCK_SIZE)
-            mask = e < elem_per_entry
-            d = e // last_axis
-            w = e % last_axis
-            src_off = (
-                pid_layer * src_layer_stride
-                + src_idx * src_req_stride
-                + step_idx * src_step_stride
-                + d * src_dim_stride
-                + w * src_win_stride
-            )
+            # A runtime bound costs Triton its vectorized access; when every
+            # type shares one entry length the caller passes it as ELEM.
+            if ELEM > 0:
+                mask = e < ELEM
+            else:
+                mask = e < elem_per_entry
+            if CONTIG:
+                # Inner [dim, win] contiguous on both sides, so the source
+                # offset is linear in e (see _conv_multi_contig).
+                src_off = (
+                    pid_layer * src_layer_stride
+                    + src_idx * src_req_stride
+                    + step_idx * src_step_stride
+                    + e
+                )
+            else:
+                d = e // last_axis
+                w = e % last_axis
+                src_off = (
+                    pid_layer * src_layer_stride
+                    + src_idx * src_req_stride
+                    + step_idx * src_step_stride
+                    + d * src_dim_stride
+                    + w * src_win_stride
+                )
             dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
             data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
             tl.store(dst_ptr + dst_off, data, mask=mask)
+
+
+def _conv_multi_contig(pairs) -> bool:
+    """Whether every pair's inner [dim, win] block is contiguous on both sides.
+
+    Then ``d * src_dim_stride + w * src_win_stride`` is identically ``e`` for
+    ``d = e // last_axis`` and ``w = e % last_axis``, so the kernel indexes the
+    source linearly and skips a per-element i64 divide/remainder. The
+    deduplicated conv-window view aliases along the dim axis and fails this
+    test, keeping the generic path for those layouts.
+    """
+    for dst, src in pairs:
+        last_axis = dst.shape[3]
+        if not (
+            src.stride(3) == last_axis * src.stride(4)
+            and dst.stride(2) == last_axis
+            and dst.stride(3) == 1
+        ):
+            return False
+    return True
 
 
 def _conv_multi_build_meta(pairs, block_size: int):
@@ -638,10 +677,19 @@ def fused_conv_window_scatter_multi(
     if n1 + n2 == 0:
         return
 
-    BLOCK_SIZE = 1024
-    key = tuple(
-        (dst.data_ptr(), src.data_ptr()) + tuple(src.stride()) + tuple(dst.shape)
-        for dst, src in pairs
+    contig = _conv_multi_contig(pairs)
+    BLOCK_SIZE = 16384 if contig else 1024
+    # One entry length across all conv types lets the mask be compile-time,
+    # which Triton needs to vectorize; otherwise keep the per-type bound.
+    elems = {int(dst.shape[2] * dst.shape[3]) for dst, _ in pairs}
+    ELEM = elems.pop() if len(elems) == 1 else 0
+    # BLOCK_SIZE feeds block_start in the meta, so it belongs in the cache key.
+    key = (
+        tuple(
+            (dst.data_ptr(), src.data_ptr()) + tuple(src.stride()) + tuple(dst.shape)
+            for dst, src in pairs
+        )
+        + (BLOCK_SIZE,)
     )
     cached = _conv_multi_meta_cache.get(key)
     if cached is None:
@@ -688,6 +736,8 @@ def fused_conv_window_scatter_multi(
         dst0.shape[1],
         NUM_TYPES=len(pairs),
         META_COLS=_CONV_MULTI_META_COLS,
+        CONTIG=contig,
+        ELEM=ELEM,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
