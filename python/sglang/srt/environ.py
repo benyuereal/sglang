@@ -1871,6 +1871,12 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    # Slice qkvzba into [q|k|v|z] views for NEXTN target verify instead of
+    # running the split kernel. Off keeps the split kernel (bit-identical).
+    SGLANG_HCU_FUSE_QKVZBA_VERIFY = EnvBool(False)
+    # Keep z/b as strided views out of the GDN unpack (a stays contiguous);
+    # also enables the prefill view path on HIP. Off keeps the copies.
+    SGLANG_GDN_ZBA_STRIDED = EnvBool(False)
 
     # ===================================================================
     # Plugin system

@@ -998,6 +998,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
         use_strided_prefill_z = False
+        use_verify_projection_views = False
         packed_verify = False
         if forward_batch.forward_mode.is_target_verify():
             from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -1029,21 +1030,39 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
             use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+                not _is_cpu
+                and (_is_cuda or envs.SGLANG_GDN_ZBA_STRIDED.get())
+                and forward_batch.forward_mode.is_extend_without_speculative()
             )
-            split_fn = (
-                qwen3_5_gdn_prefill_projection_views
-                if use_strided_prefill_z
-                else fused_qkvzba_split_reshape_cat_contiguous
-            )
-            mixed_qkv, z, b, a = split_fn(
-                projected_states_qkvz,
-                projected_states_ba,
-                num_k_heads_tp,
-                num_v_heads_tp,
-                self.head_k_dim,
-                self.head_v_dim,
-            )
+            use_verify_projection_views = envs.SGLANG_HCU_FUSE_QKVZBA_VERIFY.get()
+            if use_verify_projection_views:
+                mixed_qkv, z, b, a = qwen3_5_gdn_prefill_projection_views(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    num_k_heads_tp,
+                    num_v_heads_tp,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
+                # aiter's target-verify kernel hard-codes a's row pitch at HV.
+                a = a.contiguous()
+                if not envs.SGLANG_GDN_ZBA_STRIDED.get():
+                    z = z.contiguous()
+                    b = b.contiguous()
+            else:
+                split_fn = (
+                    qwen3_5_gdn_prefill_projection_views
+                    if use_strided_prefill_z
+                    else fused_qkvzba_split_reshape_cat_contiguous
+                )
+                mixed_qkv, z, b, a = split_fn(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    num_k_heads_tp,
+                    num_v_heads_tp,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba
@@ -1073,9 +1092,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         assert z is not None
 
         z_shape_og = z.shape
+        use_projection_views = use_strided_prefill_z or use_verify_projection_views
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        if use_strided_prefill_z:
+        if use_projection_views:
             z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
         else:
             z = z.reshape(-1, z.shape[-1])
@@ -1088,7 +1108,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
-        if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
+        if not use_projection_views and _fp8_tuple_input(
+            self.out_proj, len(z) // nv
+        ):
             fp8, _, _ = _layer_norm_fwd(
                 core_attn_out,
                 self.norm.weight,
